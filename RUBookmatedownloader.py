@@ -44,26 +44,27 @@ HEADERS = {
     'accept-encoding': '',
     'user-agent': ''
 }
+BASE_URL = "https://api.bookmate.yandex.net/api/v5"
 URLS = {
     "book": {
-        "infoUrl": "https://api.bookmate.yandex.net/api/v5/books/{uuid}",
-        "contentUrl": "https://api.bookmate.yandex.net/api/v5/books/{uuid}/content/v4"
+        "infoUrl": f"{BASE_URL}/books/{{uuid}}",
+        "contentUrl": f"{BASE_URL}/books/{{uuid}}/content/v4"
     },
     "audiobook": {
-        "infoUrl": "https://api.bookmate.yandex.net/api/v5/audiobooks/{uuid}",
-        "contentUrl": "https://api.bookmate.yandex.net/api/v5/audiobooks/{uuid}/playlists.json"
+        "infoUrl": f"{BASE_URL}/audiobooks/{{uuid}}",
+        "contentUrl": f"{BASE_URL}/audiobooks/{{uuid}}/playlists.json"
     },
     "comicbook": {
-        "infoUrl": "https://api.bookmate.yandex.net/api/v5/comicbooks/{uuid}",
-        "contentUrl": "https://api.bookmate.yandex.net/api/v5/comicbooks/{uuid}/metadata.json"
+        "infoUrl": f"{BASE_URL}/comicbooks/{{uuid}}",
+        "contentUrl": f"{BASE_URL}/comicbooks/{{uuid}}/metadata.json"
     },
     "serial": {
-        "infoUrl": "https://api.bookmate.yandex.net/api/v5/books/{uuid}",
-        "contentUrl": "https://api.bookmate.yandex.net/api/v5/books/{uuid}/episodes"
+        "infoUrl": f"{BASE_URL}/books/{{uuid}}",
+        "contentUrl": f"{BASE_URL}/books/{{uuid}}/episodes"
     },
     "series": {
-        "infoUrl": "https://api.bookmate.yandex.net/api/v5/series/{uuid}",
-        "contentUrl": "https://api.bookmate.yandex.net/api/v5/series/{uuid}/parts"
+        "infoUrl": f"{BASE_URL}/series/{{uuid}}",
+        "contentUrl": f"{BASE_URL}/series/{{uuid}}/parts"
     }
 }
 

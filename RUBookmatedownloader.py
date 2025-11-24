@@ -18,19 +18,14 @@ import httpx
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from PIL import Image
+from pathlib import Path
 
 UA = {
     1: "Samsung/Galaxy_A51 Android/12 Bookmate/3.7.3",
     2: "Huawei/P40_Lite Android/11 Bookmate/3.7.3",
     3: "OnePlus/Nord_N10 Android/10 Bookmate/3.7.3"
-    # 4: "Google/Pixel_4a Android/9 Bookmate/3.7.3",
-    # 5: "Oppo/Reno_4 Android/8 Bookmate/3.7.3",
-    # 6: "Xiaomi/Redmi_Note_9 Android/10 Bookmate/3.7.3",
-    # 7: "Motorola/Moto_G_Power Android/10 Bookmate/3.7.3",
-    # 8: "Sony/Xperia_10 Android/10 Bookmate/3.7.3",
-    # 9: "LG/Velvet Android/10 Bookmate/3.7.3",
-    # 10: "Realme/6_Pro Android/10 Bookmate/3.7.3",
 }
+
 HEADERS = {
     'app-user-agent': UA[random.randint(1, 3)],
     'mcc': '',
@@ -46,6 +41,7 @@ HEADERS = {
     'accept-encoding': '',
     'user-agent': ''
 }
+
 BASE_URL = "https://api.bookmate.yandex.net/api/v5"
 URLS = {
     "book": {
@@ -67,6 +63,9 @@ URLS = {
     "series": {
         "infoUrl": f"{BASE_URL}/series/{{uuid}}",
         "contentUrl": f"{BASE_URL}/series/{{uuid}}/parts"
+    },
+    "author": {
+        "audiobooksUrl": f"{BASE_URL}/authors/{{uuid}}/audiobooks?role=author"
     }
 }
 
@@ -74,12 +73,13 @@ URLS = {
 def get_auth_token():
     if os.path.isfile("token.txt"):
         with open("token.txt", encoding='utf-8') as file:
-            return file.read()
+            return file.read().strip()
     if HEADERS['auth-token']:
         return HEADERS['auth-token']
     auth_token = run_auth_webview()
-    with open("token.txt", "w", encoding='utf-8') as file:
-        file.write(auth_token)
+    if auth_token:
+        with open("token.txt", "w", encoding='utf-8') as file:
+            file.write(auth_token)
     return auth_token
 
 
@@ -90,9 +90,9 @@ def run_auth_webview():
     def on_loaded(window):
         if "yx4483e97bab6e486a9822973109a14d05.oauth.yandex.ru" in urllib.parse.urlparse(window.get_current_url()).netloc:
             url = urllib.parse.urlparse(window.get_current_url())
-            window.auth_token = urllib.parse.parse_qs(url.fragment)[
-                'access_token'][0]
-            window.destroy()
+            if 'access_token' in urllib.parse.parse_qs(url.fragment):
+                window.auth_token = urllib.parse.parse_qs(url.fragment)['access_token'][0]
+                window.destroy()
 
     window = webview.create_window(
         'Вход в аккаунт', 'https://oauth.yandex.ru/authorize?response_type=token&client_id=4483e97bab6e486a9822973109a14d05')
@@ -105,56 +105,264 @@ def run_auth_webview():
 def replace_forbidden_chars(filename):
     forbidden_chars = '\\/:*?"<>|'
     chars = re.escape(forbidden_chars)
-    return re.sub(f'[{chars}]', '', filename)
+    return re.sub(f'[{chars}]', '', filename).strip()
 
 
-async def download_file(url, file_path):
-    is_download = False
-    count = 0
-    while not is_download:
-        async with httpx.AsyncClient(http2=True, verify=False) as client:
-            response = await client.get(url, headers=HEADERS, timeout=None)
-            if response.status_code == 200:
-                is_download = True
-                with open(file_path, 'wb') as file:
-                    file.write(response.content)
-                print(f"File downloaded successfully to {file_path}")
-            elif response.is_redirect:
-                response = await client.get(response.next_request.url)
+class BookmateDownloader:
+    def __init__(self):
+        self.client = None
+        self.semaphore = asyncio.Semaphore(3)  # Limit concurrent book downloads
+
+    async def __aenter__(self):
+        self.client = httpx.AsyncClient(http2=True, verify=False, timeout=None)
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.client:
+            await self.client.aclose()
+
+    async def _request(self, url, method='GET', **kwargs):
+        count = 0
+        while count < 3:
+            try:
+                response = await self.client.request(method, url, headers=HEADERS, **kwargs)
                 if response.status_code == 200:
-                    is_download = True
-                    with open(file_path, 'wb') as file:
-                        file.write(response.content)
-                    print(f"File downloaded successfully to {file_path}")
-            else:
-                print(
-                    f"Failed to download file. Status code: {response.status_code}")
-                count += 1
-                if count == 3:
-                    print(
-                        "Failed to download the file check if the id is correct or try again later")
-                    sys.exit()
-                time.sleep(5)
+                    return response
+                elif response.is_redirect:
+                    url = response.next_request.url
+                    continue
+                else:
+                    print(f"Request failed: {response.status_code} {url}")
+            except Exception as e:
+                print(f"Request error: {e}")
+            
+            count += 1
+            await asyncio.sleep(2 * count)
+        
+        print(f"Failed to fetch {url} after 3 attempts")
+        return None
 
+    async def download_file(self, url, file_path):
+        response = await self._request(url)
+        if response:
+            with open(file_path, 'wb') as file:
+                file.write(response.content)
+            # print(f"Downloaded: {os.path.basename(file_path)}")
+            return True
+        return False
 
-async def send_request(url):
-    is_download = False
-    count = 0
-    while not is_download:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=HEADERS, timeout=None)
-            if response.status_code == 200:
-                is_download = True
-                return response
+    async def get_resource_info(self, resource_type, uuid, series=''):
+        info_url = URLS[resource_type]['infoUrl'].format(uuid=uuid)
+        response = await self._request(info_url)
+        if not response:
+            return None
+        
+        info = response.json()
+        if not info:
+            return None
+
+        # Handle different response structures if necessary
+        if resource_type not in info:
+             # Fallback or error
+             pass
+
+        title = info[resource_type]["title"]
+        title = replace_forbidden_chars(title)
+        
+        # Determine download directory
+        if series:
+            # series is expected to be "AuthorName/SeriesName/" or similar
+            download_dir = f"mybooks/series/{series}{title}/"
+        else:
+            download_dir = f"mybooks/{resource_type}/{title}/"
+            
+        os.makedirs(os.path.dirname(download_dir), exist_ok=True)
+        path = f'{download_dir}{title}'
+        
+        # Save cover
+        if "cover" in info[resource_type] and "large" in info[resource_type]["cover"]:
+            picture_url = info[resource_type]["cover"]["large"]
+            await self.download_file(picture_url, f'{path}.jpeg')
+            
+        # Save metadata
+        with open(f"{path}.json", 'w', encoding='utf-8') as file:
+            file.write(json.dumps(info, ensure_ascii=False, indent=2))
+            
+        return path
+
+    async def get_resource_json(self, resource_type, uuid):
+        url = URLS[resource_type]['contentUrl'].format(uuid=uuid)
+        response = await self._request(url)
+        return response.json() if response else None
+
+    async def download_book(self, uuid, series='', serial_path=None):
+        path = serial_path if serial_path else await self.get_resource_info('book', uuid, series)
+        if not path:
+            return
+
+        print(f"Downloading book: {os.path.basename(path)}")
+        url = URLS['book']['contentUrl'].format(uuid=uuid)
+        if await self.download_file(url, f'{path}.epub'):
+            await asyncio.to_thread(epub_to_fb2, f"{path}.epub", f"{path}.fb2")
+            print(f"✅ Book downloaded: {path}.epub")
+
+    async def download_audiobook(self, uuid, series='', max_bitrate=False, merge_chapters=True, cleanup_chapters=True):
+        path = await self.get_resource_info('audiobook', uuid, series)
+        if not path:
+            return
+
+        print(f"Downloading audiobook: {os.path.basename(path)}")
+        resp = await self.get_resource_json('audiobook', uuid)
+        if not resp:
+            return
+
+        bitrate = 'max_bit_rate' if max_bitrate else 'min_bit_rate'
+        tracks = resp.get('tracks', [])
+        
+        tasks = []
+        download_dir = os.path.dirname(path)
+        existing_files = set(os.listdir(download_dir))
+        
+        for track in tracks:
+            name = f'Глава_{track["number"]+1}.m4a'
+            if name in existing_files:
+                continue
+                
+            download_url = track['offline'][bitrate]['url'].replace(".m3u8", ".m4a")
+            file_path = os.path.join(download_dir, name)
+            tasks.append(self.download_file(download_url, file_path))
+
+        if tasks:
+            print(f"Downloading {len(tracks)} chapters...")
+            results = await asyncio.gather(*tasks)
+            if not all(results):
+                print("⚠️ Some chapters failed to download")
+        
+        if merge_chapters:
+            print(f"Merging audiobook: {os.path.basename(path)}")
+            # Run merge in a separate thread to avoid blocking
+            await asyncio.to_thread(
+                merge_audiobook_chapters_ffmpeg, 
+                download_dir, 
+                f"{path}_complete.m4a", 
+                None, # Metadata is loaded from json inside the function
+                cleanup_chapters
+            )
+
+    async def download_comicbook(self, uuid, series=''):
+        path = await self.get_resource_info('comicbook', uuid, series)
+        if not path:
+            return
+            
+        resp = await self.get_resource_json('comicbook', uuid)
+        if resp:
+            download_url = resp["uris"]["zip"]
+            if await self.download_file(download_url, f'{path}.cbr'):
+                # Process comicbook (unzip, convert to pdf)
+                # This is blocking, so run in thread
+                await asyncio.to_thread(self._process_comicbook, path)
+
+    def _process_comicbook(self, path):
+        with zipfile.ZipFile(f'{path}.cbr', 'r') as zip_ref:
+            zip_ref.extractall(os.path.dirname(path))
+        shutil.rmtree(os.path.dirname(path)+"/preview", ignore_errors=True)
+        create_pdf_from_images(os.path.dirname(path), f"{path}.pdf")
+
+    async def download_serial(self, uuid):
+        path = await self.get_resource_info('book', uuid)
+        if not path:
+            return
+            
+        resp = await self.get_resource_json('serial', uuid)
+        if resp:
+            tasks = []
+            for episode_index, episode in enumerate(resp["episodes"]):
+                name = f"{episode_index+1}. {episode['title']}"
+                name = replace_forbidden_chars(name)
+                download_dir = f'{os.path.dirname(path)}/{name}'
+                os.makedirs(download_dir, exist_ok=True)
+                tasks.append(self.download_book(episode['uuid'], serial_path=f'{download_dir}/{name}'))
+            
+            await asyncio.gather(*tasks)
+
+    async def download_series(self, uuid):
+        path = await self.get_resource_info('series', uuid)
+        if not path:
+            return
+            
+        resp = await self.get_resource_json('series', uuid)
+        if not resp:
+            return
+            
+        name = os.path.basename(path)
+        print(f"Downloading series: {name}")
+        
+        tasks = []
+        for part_index, part in enumerate(resp['parts']):
+            resource_type = part['resource_type']
+            resource_uuid = part['resource']['uuid']
+            
+            # Determine function
+            if resource_type == 'book':
+                func = self.download_book
+            elif resource_type == 'audiobook':
+                func = self.download_audiobook
+            elif resource_type == 'comicbook':
+                func = self.download_comicbook
             else:
-                print(
-                    f"Failed to send request. Status code: {response.status_code}")
-                count += 1
-                if count == 3:
-                    print(
-                        "Failed to download the file check if the id is correct or try again later")
-                    sys.exit()
-                time.sleep(5)
+                print(f"Unknown resource type: {resource_type}")
+                continue
+                
+            series_prefix = f"{name}/{part_index+1}. "
+            
+            # Use semaphore to limit concurrent downloads
+            tasks.append(self._bounded_download(func, resource_uuid, series=series_prefix))
+            
+        await asyncio.gather(*tasks)
+
+    async def download_author_audiobooks(self, uuid, max_bitrate=False, merge_chapters=True, cleanup_chapters=True):
+        author_url = URLS['author']['audiobooksUrl'].format(uuid=uuid)
+        print(f"Fetching audiobooks for author {uuid}...")
+        
+        resp = await self._request(author_url)
+        if not resp:
+            return
+            
+        data = resp.json()
+        if 'audiobooks' not in data:
+            print("No audiobooks found")
+            return
+            
+        audiobooks = data['audiobooks']
+        
+        # Get author name
+        author_name = "Unknown Author"
+        if audiobooks and audiobooks[0].get('authors'):
+            author_name = audiobooks[0]['authors'][0].get('name', 'Unknown Author')
+            
+        author_folder = replace_forbidden_chars(author_name)
+        print(f"Found {len(audiobooks)} audiobooks by {author_name}")
+        
+        tasks = []
+        for i, audiobook in enumerate(audiobooks, 1):
+            series_path = f"{author_folder}/{i:02d}. "
+            tasks.append(self._bounded_download(
+                self.download_audiobook, 
+                audiobook['uuid'], 
+                series=series_path,
+                max_bitrate=max_bitrate,
+                merge_chapters=merge_chapters,
+                cleanup_chapters=cleanup_chapters
+            ))
+            
+        await asyncio.gather(*tasks)
+
+    async def _bounded_download(self, func, *args, **kwargs):
+        async with self.semaphore:
+            try:
+                await func(*args, **kwargs)
+            except Exception as e:
+                print(f"Error in download: {e}")
 
 
 def create_pdf_from_images(images_folder, output_pdf):
@@ -176,7 +384,11 @@ def create_pdf_from_images(images_folder, output_pdf):
 def epub_to_fb2(epub_path, fb2_path):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        book = epub.read_epub(epub_path)
+        try:
+            book = epub.read_epub(epub_path)
+        except Exception as e:
+            print(f"Error reading epub {epub_path}: {e}")
+            return
 
     fb2_content = '<?xml version="1.0" encoding="UTF-8"?>\n<fb2 xmlns="http://www.gribuser.ru/xml/fictionbook/2.0" xmlns:l="http://www.w3.org/1999/xlink">\n<body>'
     for item in book.get_items():
@@ -194,49 +406,10 @@ def epub_to_fb2(epub_path, fb2_path):
     print(f"fb2 file save to {fb2_path}")
 
 
-def get_resource_info(resource_type, uuid, series=''):
-    info_url = URLS[resource_type]['infoUrl'].format(uuid=uuid)
-    info = asyncio.run(send_request(info_url)).json()
-    if info:
-        picture_url = info[resource_type]["cover"]["large"]
-        name = info[resource_type]["title"]
-        name = replace_forbidden_chars(name)
-        download_dir = f"mybooks/{'series' if series else resource_type}/{series}{name}/"
-        path = f'{download_dir}{name}'
-        os.makedirs(os.path.dirname(download_dir), exist_ok=True)
-        asyncio.run(download_file(picture_url, f'{path}.jpeg'))
-        with open(f"{path}.json", 'w', encoding='utf-8') as file:
-            file.write(json.dumps(info, ensure_ascii=False))
-        print(f"File downloaded successfully to {path}.json")
-    return path
-
-
-def get_resource_json(resource_type, uuid):
-    url = URLS[resource_type]['contentUrl'].format(uuid=uuid)
-    return asyncio.run(send_request(url)).json()
-
-
-def download_book(uuid, series='', serial_path=None):
-    path = serial_path if serial_path else get_resource_info(
-        'book', uuid, series)
-    asyncio.run(download_file(
-        URLS['book']['contentUrl'].format(uuid=uuid), f'{path}.epub'))
-    epub_to_fb2(f"{path}.epub", f"{path}.fb2")
-
-
 def merge_audiobook_chapters_ffmpeg(audiobook_dir, output_file, metadata=None, cleanup_chapters=True):
     """
     Merge all M4A chapter files in a directory into a single audiobook using ffmpeg
-    
-    Args:
-        audiobook_dir: Path to the directory containing chapter files
-        output_file: Path for the merged output file
-        metadata: Dictionary of metadata to embed
-        cleanup_chapters: Whether to remove individual chapter files after successful merge
     """
-    from pathlib import Path
-    import subprocess
-    
     audiobook_path = Path(audiobook_dir)
     
     # Find all M4A files and sort them naturally
@@ -247,8 +420,6 @@ def merge_audiobook_chapters_ffmpeg(audiobook_dir, output_file, metadata=None, c
         print(f"No chapter files found in {audiobook_path}")
         return False
     
-    print(f"Found {len(chapter_files)} chapters, merging with ffmpeg...")
-    
     # Look for cover image
     cover_image = None
     for ext in ['.jpeg', '.jpg', '.png']:
@@ -256,16 +427,37 @@ def merge_audiobook_chapters_ffmpeg(audiobook_dir, output_file, metadata=None, c
         if potential_cover.exists():
             cover_image = potential_cover
             break
+            
+    # Load metadata from json if not provided
+    if metadata is None:
+        json_file = audiobook_path / f"{audiobook_path.name}.json"
+        if json_file.exists():
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    info = json.load(f)
+                    if 'audiobook' in info:
+                        book_info = info['audiobook']
+                        author_name = 'Unknown Author'
+                        if 'authors' in book_info and book_info['authors']:
+                            author_name = book_info['authors'][0].get('name', 'Unknown Author')
+                        
+                        metadata = {
+                            'title': book_info.get('title', audiobook_path.name),
+                            'artist': author_name,
+                            'album': book_info.get('title', audiobook_path.name),
+                            'album_artist': author_name,
+                            'genre': 'Audiobook',
+                            'media_type': '2',
+                        }
+            except Exception:
+                pass
     
     # Create a temporary file list for ffmpeg
     filelist_path = audiobook_path / "chapters_list.txt"
-    
-    # Create chapter metadata file
     chapters_metadata_path = audiobook_path / "chapters_metadata.txt"
     
     try:
         # Get chapter durations first
-        print("📊 Analyzing chapter durations...")
         chapter_durations = []
         current_time = 0.0
         
@@ -278,250 +470,159 @@ def merge_audiobook_chapters_ffmpeg(audiobook_dir, output_file, metadata=None, c
             duration_result = subprocess.run(duration_cmd, capture_output=True, text=True)
             
             if duration_result.returncode == 0:
-                duration = float(duration_result.stdout.strip())
-                chapter_durations.append((current_time, current_time + duration, chapter_file))
-                current_time += duration
+                try:
+                    duration = float(duration_result.stdout.strip())
+                    chapter_durations.append((current_time, current_time + duration, chapter_file))
+                    current_time += duration
+                except ValueError:
+                    chapter_durations.append((current_time, current_time + 180, chapter_file))
+                    current_time += 180
             else:
-                print(f"⚠️ Could not get duration for {chapter_file.name}")
-                chapter_durations.append((current_time, current_time + 180, chapter_file))  # Fallback: 3 minutes
+                chapter_durations.append((current_time, current_time + 180, chapter_file))
                 current_time += 180
         
         # Write file list for ffmpeg concat
         with open(filelist_path, 'w', encoding='utf-8') as f:
             for chapter_file in chapter_files:
-                # Use absolute path and escape single quotes for ffmpeg
                 abs_path = str(chapter_file.absolute()).replace("'", "'\"'\"'")
                 f.write(f"file '{abs_path}'\n")
         
         # Create chapters metadata file
         with open(chapters_metadata_path, 'w', encoding='utf-8') as f:
             f.write(";FFMETADATA1\n")
-            
-            # Add global metadata
             if metadata:
                 for key, value in metadata.items():
                     if value:
-                        # Escape special characters for ffmetadata
                         escaped_value = str(value).replace('=', '\\=').replace(';', '\\;').replace('#', '\\#').replace('\\', '\\\\')
                         f.write(f"{key.upper()}={escaped_value}\n")
             
-            # Add chapter markers
             for i, (start_time, end_time, chapter_file) in enumerate(chapter_durations):
                 chapter_num = i + 1
-                chapter_title = f"Глава {chapter_num}"
-                
                 f.write("\n[CHAPTER]\n")
-                f.write("TIMEBASE=1/1000\n")  # Milliseconds
+                f.write("TIMEBASE=1/1000\n")
                 f.write(f"START={int(start_time * 1000)}\n")
                 f.write(f"END={int(end_time * 1000)}\n")
-                f.write(f"title={chapter_title}\n")
+                f.write(f"title=Глава {chapter_num}\n")
         
-        # FFmpeg command to concatenate files
+        # FFmpeg command
         cmd = [
-            'ffmpeg', '-y',  # -y to overwrite output file
+            'ffmpeg', '-y',
             '-f', 'concat',
             '-safe', '0',
             '-i', str(filelist_path),
-            '-i', str(chapters_metadata_path),  # Chapter metadata
+            '-i', str(chapters_metadata_path),
         ]
         
-        # Add cover image if available
         if cover_image:
             cmd.extend(['-i', str(cover_image)])
-            cmd.extend(['-c:v', 'copy'])  # Copy video/image stream
-            cmd.extend(['-c:a', 'copy'])  # Copy audio stream
-            cmd.extend(['-disposition:v:0', 'attached_pic'])  # Mark image as cover
-            cmd.extend(['-map_metadata', '1'])  # Use metadata from chapters file
+            cmd.extend(['-c:v', 'copy'])
+            cmd.extend(['-c:a', 'copy'])
+            cmd.extend(['-disposition:v:0', 'attached_pic'])
+            cmd.extend(['-map_metadata', '1'])
         else:
-            cmd.extend(['-c', 'copy'])  # Copy without re-encoding
-            cmd.extend(['-map_metadata', '1'])  # Use metadata from chapters file
+            cmd.extend(['-c', 'copy'])
+            cmd.extend(['-map_metadata', '1'])
         
-        # Add metadata if available (this will override the metadata file if needed)
         if metadata:
             for key, value in metadata.items():
-                if value:  # Only add non-empty values
+                if value:
                     cmd.extend(['-metadata', f'{key}={value}'])
-        else:
-            # Fallback metadata
-            cmd.extend(['-metadata', f'title={audiobook_path.name}'])
-            cmd.extend(['-metadata', 'genre=Audiobook'])
-            cmd.extend(['-metadata', 'media_type=2'])
         
         cmd.append(str(output_file))
         
-        # Run ffmpeg
         result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
         
         if result.returncode == 0:
-            print(f"✅ Successfully merged audiobook: {output_file}")
-            # Get file size
-            size_mb = Path(output_file).stat().st_size / (1024 * 1024)
-            print(f"Output file size: {size_mb:.1f} MB")
-            if cover_image:
-                print(f"📷 Cover image embedded: {cover_image.name}")
-            print(f"📑 Chapter markers added: {len(chapter_files)} chapters")
-            
-            # Clean up individual chapter files after successful merge (if requested)
+            print(f"✅ Successfully merged: {os.path.basename(output_file)}")
             if cleanup_chapters:
-                print("🧹 Cleaning up chapter files...")
                 for chapter_file in chapter_files:
                     try:
                         chapter_file.unlink()
-                        print(f"   Removed: {chapter_file.name}")
-                    except OSError as e:
-                        print(f"   ⚠️ Could not remove {chapter_file.name}: {e}")
-                
-                print(f"✨ Cleanup complete. Merged audiobook ready: {Path(output_file).name}")
-            else:
-                print(f"📁 Chapter files preserved. Merged audiobook ready: {Path(output_file).name}")
-            
+                    except OSError:
+                        pass
             return True
         else:
-            print(f"❌ Error merging audiobook with ffmpeg:")
-            print(result.stderr)
+            print(f"❌ Error merging audiobook: {result.stderr}")
             return False
             
     finally:
-        # Clean up temporary files
         if filelist_path.exists():
             filelist_path.unlink()
         if chapters_metadata_path.exists():
             chapters_metadata_path.unlink()
 
 
-def download_audiobook(uuid, series='', max_bitrate=False, merge_chapters=True, cleanup_chapters=True):
-    path = get_resource_info('audiobook', uuid, series)
-    resp = get_resource_json('audiobook', uuid)
-    metadata = None
-    
-    # Extract metadata from the JSON file if it exists
-    json_file = f"{path}.json"
-    metadata = None
-    if os.path.exists(json_file):
-        with open(json_file, 'r', encoding='utf-8') as f:
-            info = json.load(f)
-            if 'audiobook' in info:
-                book_info = info['audiobook']
+def list_author_audiobooks(uuid):
+    # This function is synchronous in the original code, but we can make it use the async class
+    # Or just keep it simple. Let's use the async class for consistency.
+    async def _list():
+        async with BookmateDownloader() as downloader:
+            author_url = URLS['author']['audiobooksUrl'].format(uuid=uuid)
+            resp = await downloader._request(author_url)
+            if not resp:
+                return
+            
+            data = resp.json()
+            if 'audiobooks' not in data:
+                print("No audiobooks found")
+                return
                 
-                # Extract author name
-                author_name = 'Unknown Author'
-                if 'authors' in book_info and book_info['authors']:
-                    author_name = book_info['authors'][0].get('name', 'Unknown Author')
+            audiobooks = data['audiobooks']
+            author_name = "Unknown Author"
+            if audiobooks and audiobooks[0].get('authors'):
+                author_name = audiobooks[0]['authors'][0].get('name', 'Unknown Author')
+            
+            print(f"\n📚 Audiobooks by {author_name} ({len(audiobooks)} books)")
+            print("=" * 70)
+            
+            total_duration = 0
+            for i, audiobook in enumerate(audiobooks, 1):
+                title = audiobook['title']
+                uuid_book = audiobook['uuid']
+                duration = audiobook.get('duration', 0)
+                duration_hours = round(duration / 3600, 1)
                 
-                # Extract narrator name
-                narrator_name = ''
-                if 'narrators' in book_info and book_info['narrators']:
-                    narrator_names = [n.get('name', '') for n in book_info['narrators']]
-                    narrator_name = ', '.join(filter(None, narrator_names))
-                
-                # Extract publisher name
-                publisher_name = ''
-                if 'publishers' in book_info and book_info['publishers']:
-                    publisher_name = book_info['publishers'][0].get('name', '')
-                
-                metadata = {
-                    'title': book_info.get('title', os.path.basename(path)),
-                    'artist': author_name,
-                    'album': book_info.get('title', os.path.basename(path)),
-                    'album_artist': author_name,
-                    'composer': author_name,
-                    'genre': 'Audiobook',
-                    'media_type': '2',
-                    'comment': book_info.get('annotation', ''),
-                    'publisher': publisher_name,
-                    'language': book_info.get('language', 'ru'),
-                }
-                
-                # Add narrator if available
-                if narrator_name:
-                    metadata['performer'] = narrator_name
-                
-                # Remove empty values
-                metadata = {k: v for k, v in metadata.items() if v}
-    
-    if resp:
-        bitrate = 'max_bit_rate' if max_bitrate else 'min_bit_rate'
-        json_data = resp['tracks']
-        files = os.listdir(os.path.dirname(path))
-        for track in json_data:
-            name = f'Глава_{track["number"]+1}.m4a'
-            if name not in files:
-                download_url = track['offline'][bitrate]['url'].replace(".m3u8", ".m4a")
-                asyncio.run(download_file(
-                    download_url, f'{os.path.dirname(path)}/{name}'))
-    
-    # Skip merging if requested
-    if not merge_chapters:
-        print(f"📁 Audiobook chapters saved separately in: {os.path.dirname(path)}")
-        return
-    
-    # Try ffmpeg first, fallback to pydub if ffmpeg fails
-    output_file = f"{path}_complete.m4a"
-    audiobook_dir = os.path.dirname(path)
-    
-    # Check if ffmpeg is available and try to merge
-    try:
-        success = merge_audiobook_chapters_ffmpeg(audiobook_dir, output_file, metadata, cleanup_chapters=cleanup_chapters)
-        if success:
-            print(f"Merged audiobook saved to {output_file}")
-            return
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"ffmpeg not available or failed: {e}")
-        print("Falling back to pydub method...")
-    
-    # Fallback to original pydub method
-    audio_files = sorted(
-        glob.glob(os.path.join(os.path.dirname(path), "Глава_*.m4a")),
-        key=lambda x: int(re.search(r'Глава_(\d+)\.m4a', x).group(1))
-    )
-    if audio_files:
-        from pydub import AudioSegment
-        merged = AudioSegment.empty()
-        for file in audio_files:
-            merged += AudioSegment.from_file(file)
-        merged.export(f"{path}.m4a", format="mp4")
-        print(f"Merged audiobook saved to {path}.m4a")
+                total_duration += duration
+                print(f"{i:2d}. {title}")
+                print(f"    UUID: {uuid_book}")
+                print(f"    Duration: {duration_hours}h")
+                print()
+            
+            print("=" * 70)
+            print(f"📊 Total: {len(audiobooks)} audiobooks, {round(total_duration / 3600, 1)} hours")
+
+    asyncio.run(_list())
 
 
-def download_comicbook(uuid, series=''):
-    path = get_resource_info('comicbook', uuid, series)
-    resp = get_resource_json('comicbook', uuid)
-    if resp:
-        download_url = resp["uris"]["zip"]
-        asyncio.run(download_file(download_url, f'{path}.cbr'))
-        with zipfile.ZipFile(f'{path}.cbr', 'r') as zip_ref:
-            zip_ref.extractall(os.path.dirname(path))
-        shutil.rmtree(os.path.dirname(path)+"/preview",
-                      ignore_errors=False, onerror=None)
-        create_pdf_from_images(os.path.dirname(path), f"{path}.pdf")
-
-
-def download_serial(uuid):
-    path = get_resource_info('book', uuid)
-    resp = get_resource_json('serial', uuid)
-    if resp:
-        for episode_index, episode in enumerate(resp["episodes"]):
-            name = f"{episode_index+1}. {episode['title']}"
-            download_dir = f'{os.path.dirname(path)}/{name}'
-            os.makedirs(download_dir, exist_ok=True)
-            download_book(episode['uuid'],
-                          serial_path=f'{download_dir}/{name}')
-
-
-def download_series(uuid):
-    path = get_resource_info('series', uuid)
-    resp = get_resource_json('series', uuid)
-    name = os.path.basename(path)
-    print(name)
-    for part_index, part in enumerate(resp['parts']):
-        print(part['resource_type'], part['resource']['uuid'])
-        func = FUNCTION_MAP[part['resource_type']]
-        func(part['resource']['uuid'], f"{name}/{part_index+1}. ")
+async def run_async_main(args):
+    async with BookmateDownloader() as downloader:
+        if args.command == 'book':
+            await downloader.download_book(args.uuid)
+        elif args.command == 'audiobook':
+            await downloader.download_audiobook(
+                args.uuid, 
+                max_bitrate=args.max_bitrate, 
+                merge_chapters=not args.no_merge, 
+                cleanup_chapters=not args.keep_chapters
+            )
+        elif args.command == 'comicbook':
+            await downloader.download_comicbook(args.uuid)
+        elif args.command == 'serial':
+            await downloader.download_serial(args.uuid)
+        elif args.command == 'series':
+            await downloader.download_series(args.uuid)
+        elif args.command == 'author':
+            await downloader.download_author_audiobooks(
+                args.uuid,
+                max_bitrate=args.max_bitrate,
+                merge_chapters=not args.no_merge,
+                cleanup_chapters=not args.keep_chapters
+            )
 
 
 def main():
     argparser = argparse.ArgumentParser()
-    argparser.add_argument("command", choices=FUNCTION_MAP.keys())
+    argparser.add_argument("command", choices=['book', 'audiobook', 'comicbook', 'serial', 'series', 'author', 'list-author'])
     argparser.add_argument("uuid")
     argparser.add_argument("--max_bitrate", action='store_false', help="Use maximum bitrate for audiobooks")
     argparser.add_argument("--no-merge", action='store_true', help="Keep audiobook chapters as separate files (don't merge)")
@@ -530,20 +631,12 @@ def main():
 
     HEADERS['auth-token'] = get_auth_token()
 
-    func = FUNCTION_MAP[args.command]
-    if args.command == 'audiobook':
-        func(args.uuid, max_bitrate=args.max_bitrate, merge_chapters=not args.no_merge, cleanup_chapters=not args.keep_chapters)
+    if args.command == 'list-author':
+        list_author_audiobooks(args.uuid)
     else:
-        func(args.uuid)
+        asyncio.run(run_async_main(args))
 
-
-FUNCTION_MAP = {
-    'book': download_book,
-    'audiobook': download_audiobook,
-    'comicbook': download_comicbook,
-    'serial': download_serial,
-    'series': download_series
-}
 
 if __name__ == "__main__":
     main()
+

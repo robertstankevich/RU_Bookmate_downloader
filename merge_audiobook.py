@@ -232,6 +232,8 @@ def main():
     parser = argparse.ArgumentParser(description='Merge audiobook chapters into a single file')
     parser.add_argument('audiobook_path', nargs='?', help='Path to the audiobook directory')
     parser.add_argument('--batch', action='store_true', help='Process all audiobooks in mybooks/audiobook/ directory')
+    parser.add_argument('--batch-series', action='store_true', help='Process all audiobooks in mybooks/series/ directory')
+    parser.add_argument('--batch-all', action='store_true', help='Process all audiobooks in both mybooks/audiobook/ and mybooks/series/ directories')
     parser.add_argument('--force', action='store_true', help='Overwrite existing merged files')
     parser.add_argument('--keep-chapters', action='store_true', help='Keep individual chapter files after merging')
     args = parser.parse_args()
@@ -239,35 +241,72 @@ def main():
     print("🎧 Audiobook Chapter Merger")
     print("=" * 50)
     
-    if args.batch:
-        # Process all audiobooks in the mybooks/audiobook directory
-        audiobooks_dir = Path("mybooks/audiobook")
-        if not audiobooks_dir.exists():
-            print("❌ mybooks/audiobook directory not found")
-            return
+    def process_directory(base_dir, dir_type):
+        """Process audiobooks in a directory"""
+        if not base_dir.exists():
+            print(f"❌ {base_dir} directory not found")
+            return 0, 0
         
-        audiobook_dirs = [d for d in audiobooks_dir.iterdir() if d.is_dir()]
+        audiobook_dirs = []
+        
+        if dir_type == "series":
+            # For series, we need to go one level deeper (author -> books)
+            for author_dir in base_dir.iterdir():
+                if author_dir.is_dir() and not author_dir.name.startswith('.'):
+                    for book_dir in author_dir.iterdir():
+                        if book_dir.is_dir() and not book_dir.name.startswith('.'):
+                            audiobook_dirs.append(book_dir)
+        else:
+            # For regular audiobooks, books are directly in the directory
+            audiobook_dirs = [d for d in base_dir.iterdir() if d.is_dir() and not d.name.startswith('.')]
+        
         if not audiobook_dirs:
-            print("❌ No audiobook directories found")
-            return
+            print(f"❌ No audiobook directories found in {base_dir}")
+            return 0, 0
         
-        print(f"Found {len(audiobook_dirs)} audiobooks to process")
+        print(f"Found {len(audiobook_dirs)} audiobooks to process in {dir_type}")
         successful = 0
         
         for audiobook_dir in audiobook_dirs:
-            output_file = audiobook_dir / f"{audiobook_dir.name}_complete.m4a"
+            output_file = audiobook_dir / f"{audiobook_dir.name.split('. ', 1)[-1] if '. ' in audiobook_dir.name else audiobook_dir.name}_complete.m4a"
             
             # Skip if already merged and not forcing
             if output_file.exists() and not args.force:
                 print(f"⏭️  Skipping {audiobook_dir.name} (already merged, use --force to overwrite)")
                 continue
             
-            print(f"\n📚 Processing: {audiobook_dir.name}")
+            # Show the full path for series books to indicate author
+            if dir_type == "series":
+                author_name = audiobook_dir.parent.name
+                print(f"\n📚 Processing: {author_name} - {audiobook_dir.name}")
+            else:
+                print(f"\n📚 Processing: {audiobook_dir.name}")
+            
             merged_file = merge_audiobook_chapters(str(audiobook_dir), cleanup_chapters=not args.keep_chapters)
             if merged_file:
                 successful += 1
         
-        print(f"\n✅ Successfully processed {successful}/{len(audiobook_dirs)} audiobooks")
+        return successful, len(audiobook_dirs)
+    
+    if args.batch or args.batch_all:
+        # Process regular audiobooks
+        audiobooks_dir = Path("mybooks/audiobook")
+        total_successful, total_books = process_directory(audiobooks_dir, "audiobook")
+        
+        if args.batch_all:
+            # Also process series audiobooks
+            series_dir = Path("mybooks/series")
+            series_successful, series_books = process_directory(series_dir, "series")
+            total_successful += series_successful
+            total_books += series_books
+        
+        print(f"\n✅ Successfully processed {total_successful}/{total_books} audiobooks")
+        
+    elif args.batch_series:
+        # Process only series audiobooks
+        series_dir = Path("mybooks/series")
+        successful, total_books = process_directory(series_dir, "series")
+        print(f"\n✅ Successfully processed {successful}/{total_books} audiobooks")
         
     else:
         # Process single audiobook

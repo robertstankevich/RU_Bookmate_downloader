@@ -19,6 +19,7 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from PIL import Image
 from pathlib import Path
+import urllib.parse
 
 UA = {
     1: "Samsung/Galaxy_A51 Android/12 Bookmate/3.7.3",
@@ -28,18 +29,8 @@ UA = {
 
 HEADERS = {
     'app-user-agent': UA[random.randint(1, 3)],
-    'mcc': '',
-    'mnc': '',
-    'imei': '',
-    'subscription-country': '',
-    'app-locale': '',
-    'bookmate-version': '',
-    'bookmate-websocket-version': '',
-    'device-idfa': '',
     'onyx-preinstall': 'false',
     'auth-token': '',
-    'accept-encoding': '',
-    'user-agent': ''
 }
 
 BASE_URL = "https://api.bookmate.yandex.net/api/v5"
@@ -85,7 +76,6 @@ def get_auth_token():
 
 def run_auth_webview():
     import webview
-    import urllib.parse
 
     def on_loaded(window):
         if "yx4483e97bab6e486a9822973109a14d05.oauth.yandex.ru" in urllib.parse.urlparse(window.get_current_url()).netloc:
@@ -111,7 +101,8 @@ def replace_forbidden_chars(filename):
 class BookmateDownloader:
     def __init__(self):
         self.client = None
-        self.semaphore = asyncio.Semaphore(3)  # Limit concurrent book downloads
+        self.semaphore = asyncio.Semaphore(3)  # Limit concurrent book/series downloads
+        self.chapter_semaphore = asyncio.Semaphore(10) # Limit concurrent chapter downloads
 
     async def __aenter__(self):
         self.client = httpx.AsyncClient(http2=True, verify=False, timeout=None)
@@ -123,23 +114,32 @@ class BookmateDownloader:
 
     async def _request(self, url, method='GET', **kwargs):
         count = 0
-        while count < 3:
+        while count < 5:
             try:
                 response = await self.client.request(method, url, headers=HEADERS, **kwargs)
                 if response.status_code == 200:
                     return response
+                elif response.status_code == 429:
+                    print(f"⚠️ Rate limit hit (429). Sleeping for {5 * (count + 1)}s...")
+                    sys.stdout.flush()
+                    await asyncio.sleep(5 * (count + 1))
+                    count += 1
+                    continue
                 elif response.is_redirect:
                     url = response.next_request.url
                     continue
                 else:
                     print(f"Request failed: {response.status_code} {url}")
+                    sys.stdout.flush()
             except Exception as e:
-                print(f"Request error: {e}")
+                print(f"Request error: {type(e).__name__}: {e}")
+                sys.stdout.flush()
             
             count += 1
-            await asyncio.sleep(2 * count)
+            await asyncio.sleep(3 * count)
         
-        print(f"Failed to fetch {url} after 3 attempts")
+        print(f"Failed to fetch {url} after 5 attempts")
+        sys.stdout.flush()
         return None
 
     async def download_file(self, url, file_path):
@@ -188,6 +188,8 @@ class BookmateDownloader:
         with open(f"{path}.json", 'w', encoding='utf-8') as file:
             file.write(json.dumps(info, ensure_ascii=False, indent=2))
             
+        print(f"ℹ️ Info saved: {title}")
+        sys.stdout.flush()
         return path
 
     async def get_resource_json(self, resource_type, uuid):
@@ -200,18 +202,31 @@ class BookmateDownloader:
         if not path:
             return
 
+        if os.path.exists(f"{path}.epub") or os.path.exists(f"{path}.fb2"):
+            print(f"⏩ Book already exists: {os.path.basename(path)}")
+            sys.stdout.flush()
+            return
+
         print(f"Downloading book: {os.path.basename(path)}")
+        sys.stdout.flush()
         url = URLS['book']['contentUrl'].format(uuid=uuid)
         if await self.download_file(url, f'{path}.epub'):
             await asyncio.to_thread(epub_to_fb2, f"{path}.epub", f"{path}.fb2")
             print(f"✅ Book downloaded: {path}.epub")
+            sys.stdout.flush()
 
     async def download_audiobook(self, uuid, series='', max_bitrate=False, merge_chapters=True, cleanup_chapters=True):
         path = await self.get_resource_info('audiobook', uuid, series)
         if not path:
             return
 
+        if merge_chapters and os.path.exists(f"{path}_complete.m4a"):
+            print(f"⏩ Audiobook already exists: {os.path.basename(path)}_complete.m4a")
+            sys.stdout.flush()
+            return
+
         print(f"Downloading audiobook: {os.path.basename(path)}")
+        sys.stdout.flush()
         resp = await self.get_resource_json('audiobook', uuid)
         if not resp:
             return
@@ -223,6 +238,10 @@ class BookmateDownloader:
         download_dir = os.path.dirname(path)
         existing_files = set(os.listdir(download_dir))
         
+        async def download_chapter(url, path):
+            async with self.chapter_semaphore:
+                return await self.download_file(url, path)
+
         for track in tracks:
             name = f'Глава_{track["number"]+1}.m4a'
             if name in existing_files:
@@ -230,16 +249,19 @@ class BookmateDownloader:
                 
             download_url = track['offline'][bitrate]['url'].replace(".m3u8", ".m4a")
             file_path = os.path.join(download_dir, name)
-            tasks.append(self.download_file(download_url, file_path))
+            tasks.append(download_chapter(download_url, file_path))
 
         if tasks:
             print(f"Downloading {len(tracks)} chapters...")
+            sys.stdout.flush()
             results = await asyncio.gather(*tasks)
             if not all(results):
                 print("⚠️ Some chapters failed to download")
+                sys.stdout.flush()
         
         if merge_chapters:
             print(f"Merging audiobook: {os.path.basename(path)}")
+            sys.stdout.flush()
             # Run merge in a separate thread to avoid blocking
             await asyncio.to_thread(
                 merge_audiobook_chapters_ffmpeg, 
@@ -285,7 +307,7 @@ class BookmateDownloader:
             
             await asyncio.gather(*tasks)
 
-    async def download_series(self, uuid):
+    async def download_series(self, uuid, max_bitrate=False, merge_chapters=True, cleanup_chapters=True):
         path = await self.get_resource_info('series', uuid)
         if not path:
             return
@@ -296,6 +318,7 @@ class BookmateDownloader:
             
         name = os.path.basename(path)
         print(f"Downloading series: {name}")
+        sys.stdout.flush()
         
         tasks = []
         for part_index, part in enumerate(resp['parts']):
@@ -304,25 +327,54 @@ class BookmateDownloader:
             
             # Determine function
             if resource_type == 'book':
-                func = self.download_book
+                # Try to find audiobook if it's a book
+                book_title = part['resource']['title']
+                audiobook_uuid = await self._find_audiobook_by_title(book_title)
+                
+                if audiobook_uuid:
+                    print(f"Found audiobook for '{book_title}': {audiobook_uuid}")
+                    sys.stdout.flush()
+                    tasks.append(self._bounded_download(
+                        self.download_audiobook, 
+                        audiobook_uuid, 
+                        series=f"{name}/{part_index+1}. ",
+                        max_bitrate=max_bitrate,
+                        merge_chapters=merge_chapters,
+                        cleanup_chapters=cleanup_chapters
+                    ))
+                else:
+                    # If no audiobook found, download the book
+                    tasks.append(self._bounded_download(
+                        self.download_book, 
+                        resource_uuid, 
+                        series=f"{name}/{part_index+1}. "
+                    ))
             elif resource_type == 'audiobook':
-                func = self.download_audiobook
+                tasks.append(self._bounded_download(
+                    self.download_audiobook, 
+                    resource_uuid, 
+                    series=f"{name}/{part_index+1}. ",
+                    max_bitrate=max_bitrate,
+                    merge_chapters=merge_chapters,
+                    cleanup_chapters=cleanup_chapters
+                ))
             elif resource_type == 'comicbook':
-                func = self.download_comicbook
+                tasks.append(self._bounded_download(
+                    self.download_comicbook, 
+                    resource_uuid, 
+                    series=f"{name}/{part_index+1}. "
+                ))
             else:
                 print(f"Unknown resource type: {resource_type}")
+                sys.stdout.flush()
                 continue
-                
-            series_prefix = f"{name}/{part_index+1}. "
-            
-            # Use semaphore to limit concurrent downloads
-            tasks.append(self._bounded_download(func, resource_uuid, series=series_prefix))
             
         await asyncio.gather(*tasks)
 
     async def download_author_audiobooks(self, uuid, max_bitrate=False, merge_chapters=True, cleanup_chapters=True):
         author_url = URLS['author']['audiobooksUrl'].format(uuid=uuid)
         print(f"Fetching audiobooks for author {uuid}...")
+        sys.stdout.flush()
         
         resp = await self._request(author_url)
         if not resp:
@@ -331,6 +383,7 @@ class BookmateDownloader:
         data = resp.json()
         if 'audiobooks' not in data:
             print("No audiobooks found")
+            sys.stdout.flush()
             return
             
         audiobooks = data['audiobooks']
@@ -342,6 +395,7 @@ class BookmateDownloader:
             
         author_folder = replace_forbidden_chars(author_name)
         print(f"Found {len(audiobooks)} audiobooks by {author_name}")
+        sys.stdout.flush()
         
         tasks = []
         for i, audiobook in enumerate(audiobooks, 1):
@@ -363,6 +417,22 @@ class BookmateDownloader:
                 await func(*args, **kwargs)
             except Exception as e:
                 print(f"Error in download: {e}")
+                sys.stdout.flush()
+
+    async def _find_audiobook_by_title(self, title):
+        query = urllib.parse.quote(title)
+        url = f"{BASE_URL}/search?query={query}"
+        response = await self._request(url)
+        if not response:
+            return None
+        
+        data = response.json()
+        if 'search' in data and 'audiobooks' in data['search']:
+            audiobooks = data['search']['audiobooks'].get('objects', [])
+            if audiobooks:
+                # Return the first match
+                return audiobooks[0]['uuid']
+        return None
 
 
 def create_pdf_from_images(images_folder, output_pdf):
@@ -534,6 +604,7 @@ def merge_audiobook_chapters_ffmpeg(audiobook_dir, output_file, metadata=None, c
         
         if result.returncode == 0:
             print(f"✅ Successfully merged: {os.path.basename(output_file)}")
+            sys.stdout.flush()
             if cleanup_chapters:
                 for chapter_file in chapter_files:
                     try:
@@ -543,6 +614,7 @@ def merge_audiobook_chapters_ffmpeg(audiobook_dir, output_file, metadata=None, c
             return True
         else:
             print(f"❌ Error merging audiobook: {result.stderr}")
+            sys.stdout.flush()
             return False
             
     finally:
@@ -610,7 +682,12 @@ async def run_async_main(args):
         elif args.command == 'serial':
             await downloader.download_serial(args.uuid)
         elif args.command == 'series':
-            await downloader.download_series(args.uuid)
+            await downloader.download_series(
+                args.uuid,
+                max_bitrate=args.max_bitrate,
+                merge_chapters=not args.no_merge,
+                cleanup_chapters=not args.keep_chapters
+            )
         elif args.command == 'author':
             await downloader.download_author_audiobooks(
                 args.uuid,
